@@ -19,6 +19,134 @@ use super::discovery::{claude_projects_dir, discover_sessions, find_local_projec
 use super::state::SyncState;
 use super::MAX_CONVERSATIONS_TO_DISPLAY;
 
+/// Determine the winning settings.json content during a pull.
+///
+/// ## Strategy
+///
+/// 1. If there's no remote file — use local file (handled by caller).
+/// 2. If local has no `lastModifiedTimestamp` — remote wins (local is likely a default).
+/// 3. Otherwise compare local file mtime with remote's `lastModifiedTimestamp` — newer wins.
+///    If local is newer, update `lastModifiedTimestamp` in the result to match the file mtime
+///    so the change can be pushed back to remote.
+///
+/// ## Return value
+///
+/// Returns `(result_map, local_wins)` where `local_wins` is `true` when the local file won
+/// and the sync repo copy should be updated with the result.
+pub fn merge_settings_json(
+    local: &serde_json::Map<String, serde_json::Value>,
+    remote: &serde_json::Map<String, serde_json::Value>,
+    local_mtime: std::time::SystemTime,
+) -> (serde_json::Map<String, serde_json::Value>, bool) {
+    const TS_KEY: &str = "lastModifiedTimestamp";
+
+    // Rule 2: If local has no lastModifiedTimestamp, remote wins (local is likely a default).
+    if !local.contains_key(TS_KEY) {
+        return (remote.clone(), false);
+    }
+
+    // Convert local file mtime to Unix milliseconds for comparison.
+    let local_ms: i64 = local_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    // Rule 3: Compare local file mtime with remote's lastModifiedTimestamp.
+    let remote_ts_ms: Option<i64> = remote.get(TS_KEY).and_then(|v| v.as_i64());
+
+    if let Some(rts) = remote_ts_ms {
+        if rts > local_ms {
+            // Remote is newer — remote wins.
+            return (remote.clone(), false);
+        }
+    }
+
+    // Local is newer (or remote has no timestamp) — local wins.
+    // Update lastModifiedTimestamp to match the actual file mtime.
+    let mut result = local.clone();
+    result.insert(
+        TS_KEY.to_string(),
+        serde_json::Value::Number(local_ms.into()),
+    );
+    (result, true)
+}
+
+/// Pull settings.json from the sync repo into ~/.claude/settings.json.
+///
+/// ## Strategy
+///
+/// 1. No remote file — keep local as-is.
+/// 2. Remote exists, local has no `lastModifiedTimestamp` — remote wins (local is a default).
+/// 3. Otherwise compare local file mtime with remote's `lastModifiedTimestamp` — newer wins.
+///    If local wins, update `lastModifiedTimestamp` in the JSON and push back to remote.
+fn pull_settings(sync_repo_path: &Path, verbosity: crate::VerbosityLevel) -> Result<()> {
+    use crate::VerbosityLevel;
+    use std::fs;
+
+    let remote_settings = sync_repo_path.join("settings").join("settings.json");
+    if !remote_settings.exists() {
+        if verbosity != VerbosityLevel::Quiet {
+            println!("  {} No settings.json in sync repo, skipping", "ℹ".cyan());
+        }
+        return Ok(());
+    }
+
+    let home = dirs::home_dir().context("Failed to get home directory")?;
+    let local_settings = home.join(".claude").join("settings.json");
+
+    // Load remote JSON.
+    let remote_content = fs::read_to_string(&remote_settings)
+        .context("Failed to read remote settings.json")?;
+    let remote_json: serde_json::Value = serde_json::from_str(&remote_content)
+        .context("Failed to parse remote settings.json")?;
+    let remote_map = remote_json
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+
+    // Load local JSON (or use an empty map if local doesn't exist yet).
+    let (local_map, local_mtime) = if local_settings.exists() {
+        let content = fs::read_to_string(&local_settings)
+            .context("Failed to read local settings.json")?;
+        let json: serde_json::Value = serde_json::from_str(&content)
+            .context("Failed to parse local settings.json")?;
+        let mtime = fs::metadata(&local_settings)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        (json.as_object().cloned().unwrap_or_default(), mtime)
+    } else {
+        (serde_json::Map::new(), std::time::SystemTime::UNIX_EPOCH)
+    };
+
+    let (result_map, local_wins) = merge_settings_json(&local_map, &remote_map, local_mtime);
+    let result_value = serde_json::Value::Object(result_map);
+    let result_text = serde_json::to_string_pretty(&result_value)
+        .context("Failed to serialize settings.json")?;
+
+    // Write the winning content to local.
+    if let Some(parent) = local_settings.parent() {
+        fs::create_dir_all(parent).context("Failed to create ~/.claude directory")?;
+    }
+    fs::write(&local_settings, &result_text)
+        .context("Failed to write settings.json")?;
+
+    if local_wins {
+        // Local won — push the updated content (with refreshed timestamp) back to remote.
+        fs::write(&remote_settings, &result_text)
+            .context("Failed to update remote settings.json")?;
+        if verbosity != VerbosityLevel::Quiet {
+            println!(
+                "  {} settings.json (local newer, pushed back to remote)",
+                "✓".green()
+            );
+        }
+    } else if verbosity != VerbosityLevel::Quiet {
+        println!("  {} settings.json (remote applied)", "✓".green());
+    }
+
+    Ok(())
+}
+
 /// Pull and merge history from sync repository
 pub fn pull_history(
     fetch_remote: bool,
@@ -500,6 +628,16 @@ pub fn pull_history(
     }
 
     println!("  {} Merged {} sessions", "✓".green(), merged_count);
+
+    // ============================================================================
+    // SYNC SETTINGS
+    // ============================================================================
+    if filter.sync_settings {
+        if verbosity != VerbosityLevel::Quiet {
+            println!("  {} settings.json...", "Syncing".cyan());
+        }
+        pull_settings(&state.sync_repo_path, verbosity)?;
+    }
 
     // ============================================================================
     // CREATE AND SAVE OPERATION RECORD
